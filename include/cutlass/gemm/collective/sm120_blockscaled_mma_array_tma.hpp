@@ -291,6 +291,43 @@ struct CollectiveMma<
 
   static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideA, StrideA>;
 
+  // B may be stored K-tiled as (N, (KB, K/KB), L) so one representation can
+  // serve both a CPU kernel and the GPU. The tile width is N's stride, which
+  // is a compile-time Int exactly in that case, so both the global shape and
+  // the CTA tile can be rebuilt congruent with the stride from the stride
+  // alone. Flat strides take the first branch and behave exactly as before.
+  static constexpr bool IsKTiledB = cute::rank(cute::get<1>(InternalStrideB{})) != 1;
+
+  template <class TN, class TK, class TL>
+  CUTLASS_HOST_DEVICE static constexpr auto
+  make_gmem_shape_B(TN N, TK K, TL L) {
+    if constexpr (!IsKTiledB) {
+      return cute::make_shape(N, K, L);
+    }
+    else {
+      auto tile = cute::get<0>(InternalStrideB{});
+      // Grouped problems build a placeholder descriptor from the tile shape,
+      // whose K is one BLK_K and therefore smaller than one block. Round the
+      // block count up so the placeholder stays a valid descriptor; it is
+      // replaced from the real per-group shape before the first load.
+      auto blocks = cute::max(int32_t(K / tile), 1);
+      return cute::make_shape(N, cute::make_shape(tile, blocks), L);
+    }
+  }
+
+  // The CTA tile has to be congruent with those modes too, so a K-tiled B
+  // takes BLK_K from inside one block and exactly one block.
+  CUTLASS_HOST_DEVICE static constexpr auto
+  make_cta_tile_B() {
+    if constexpr (!IsKTiledB) {
+      return cute::make_shape(cute::shape<1>(TileShape{}), cute::shape<2>(TileShape{}));
+    }
+    else {
+      return cute::make_shape(cute::shape<1>(TileShape{}),
+                              cute::make_shape(cute::shape<2>(TileShape{}), cute::_1{}));
+    }
+  }
+
   // Host side kernel arguments
   struct Arguments {
     ElementA const** ptr_A{nullptr};
@@ -317,7 +354,7 @@ struct CollectiveMma<
         GmemTiledCopyB{},
         make_tensor(recast_ptr<TmaInternalElementB>(nullptr), repeat_like(InternalStrideB{}, int32_t(0)), InternalStrideB{}),
         SmemLayoutB{}(_,_,cute::Int<0>{}),
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+        make_cta_tile_B(),
         _1{}));  // No programmatic multicast
 
     using TMA_SFA = decltype(make_tma_copy<uint16_t>(
@@ -400,7 +437,7 @@ struct CollectiveMma<
     }
 
     Tensor tensor_a = make_tensor(ptr_A_first_batch, make_layout(make_shape(init_M,init_K,init_L), stride_a));
-    Tensor tensor_b = make_tensor(ptr_B_first_batch, make_layout(make_shape(init_N,init_K,init_L), stride_b));
+    Tensor tensor_b = make_tensor(ptr_B_first_batch, make_layout(make_gmem_shape_B(init_N,init_K,init_L), stride_b));
     Tensor tensor_sfa = make_tensor(ptr_SFA_first_batch, layout_SFA);
     Tensor tensor_sfb = make_tensor(ptr_SFB_first_batch, layout_SFB);
 
@@ -414,7 +451,7 @@ struct CollectiveMma<
         GmemTiledCopyB{},
         tensor_b,
         SmemLayoutB{}(_,_,cute::Int<0>{}),
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+        make_cta_tile_B(),
         _1{}); // No programmatic multicast
 
     typename Params::TMA_SFA tma_load_sfa = make_tma_copy<uint16_t>(
@@ -484,7 +521,7 @@ struct CollectiveMma<
         auto problem_shape_MNKL = append<4>(problem_shapes.get_host_problem_shape(i), 1);
         auto [M,N,K,L] = problem_shape_MNKL;
         implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_A>(cute::make_shape(M,K,L), InternalStrideA{});
-        implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_B>(cute::make_shape(N,K,L), InternalStrideB{});
+        implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_B>(make_gmem_shape_B(N,K,L), InternalStrideB{});
       }
     }
 
@@ -651,7 +688,7 @@ struct CollectiveMma<
     // TMA requires special handling of strides to deal with coord codomain mapping
     // Represent the full tensors -- get these from TMA
     Tensor mA_mkl = params.tma_load_a.get_tma_tensor(make_shape(M,K,init_L));                          // (m,k,l)
-    Tensor mB_nkl = params.tma_load_b.get_tma_tensor(make_shape(N,K,init_L));                          // (n,k,l)
+    Tensor mB_nkl = params.tma_load_b.get_tma_tensor(make_gmem_shape_B(N,K,init_L));                    // (n,k,l)
 
     // Represent the full tensor of Scale factors
     InternalLayoutSFA layout_SFA{};
@@ -1079,7 +1116,7 @@ struct CollectiveMma<
     Tensor tensor_sfa = make_tensor(ptr_SF, mainloop_params.layout_SFA[next_group]);
 
     TmaInternalElementB const* ptr_B = nullptr;
-    Tensor tensor_b = make_tensor(ptr_B, make_shape(N,K,Int<1>{}), mainloop_params.dB[next_group]);
+    Tensor tensor_b = make_tensor(ptr_B, make_gmem_shape_B(N,K,Int<1>{}), mainloop_params.dB[next_group]);
 
     Tensor tensor_sfb = make_tensor(ptr_SF, mainloop_params.layout_SFB[next_group]);
 
