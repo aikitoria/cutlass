@@ -983,7 +983,8 @@ struct CollectiveMma<
         if (k_block == K_BLOCK_MAX - 1) {
           cutlass::arch::NamedBarrier::sync(
           thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-          // UNLOCK smem_pipe_read, done _computing_ on it
+          // Finish reading this tile before the loader reuses its buffer.
+          cutlass::arch::fence_view_async_shared();
           pipeline.consumer_release(smem_pipe_read);
           ++smem_pipe_read;
           read_stage = smem_pipe_read.index();
@@ -1010,7 +1011,8 @@ struct CollectiveMma<
       if (k_block == K_BLOCK_MAX - 1) {
         cutlass::arch::NamedBarrier::sync(
         thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-        // UNLOCK smem_pipe_read, done _computing_ on it
+        // Finish reading this tile before the loader reuses its buffer.
+        cutlass::arch::fence_view_async_shared();
         pipeline.consumer_release(smem_pipe_read);
         ++smem_pipe_read;
       }
